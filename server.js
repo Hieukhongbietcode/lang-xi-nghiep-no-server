@@ -1,10 +1,11 @@
 // =====================================================================
-//  Làng Xí Nghiệp Nợ — server phòng chơi online (Giai đoạn 1: sảnh chờ)
+//  Làng Xí Nghiệp Nợ — server phòng chơi online (Giai đoạn 1: sảnh chờ · Giai đoạn 2: chia bài)
 //  - Quản trò tạo phòng, người chơi vào bằng tên + mã phòng
 //  - Khoá phòng khi quản trò bắt đầu: người MỚI bị từ chối, người CŨ vẫn vào lại được
 //  - Rớt mạng thì tự vào lại bằng mã định danh (token) lưu trên máy
 //  - Server KHÔNG giữ dữ liệu ván: máy quản trò giữ hết. Server khởi động lại thì
 //    máy quản trò tự dựng lại phòng (restore).
+//  - Tin riêng (lá bài...) CHỈ gửi tới đúng người nhận, không bao giờ gửi cả phòng.
 // =====================================================================
 const http = require('http');
 const crypto = require('crypto');
@@ -36,7 +37,7 @@ const normName = (n) => String(n || '').replace(/\s+/g, ' ').trim().slice(0, MAX
 const nameKey = (n) => normName(n).toLocaleLowerCase('vi');
 
 function makeRoom(code, gmToken) {
-    return { code, gmToken, gm: null, locked: false, players: new Map(), createdAt: Date.now(), lastActive: Date.now() };
+    return { code, gmToken, gm: null, locked: false, players: new Map(), keptAll: {}, createdAt: Date.now(), lastActive: Date.now() };
 }
 function send(ws, obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 function rosterOf(room) {
@@ -73,6 +74,12 @@ function attachPlayer(room, p, ws) {
     touch(room);
 }
 function err(ws, code, msg) { send(ws, { t: 'error', code, msg }); }
+// Gửi lại các tin quản trò đã "giữ" (lá bài, trạng thái ván) cho người vừa vào lại
+function replayKept(room, p) {
+    for (const data of Object.values(room.keptAll || {})) send(p.ws, { t: 'msg', from: 'gm', data });
+    for (const data of Object.values(p.kept || {})) send(p.ws, { t: 'msg', from: 'gm', data });
+}
+const KEEP_RE = /^[a-z_]{1,20}$/;
 
 function handle(ws, m) {
     const room = ws.room ? rooms.get(ws.room) : null;
@@ -160,6 +167,7 @@ function handle(ws, m) {
             attachPlayer(r, p, ws); // phòng đã khoá vẫn cho người CŨ vào lại
             send(ws, { t: 'joined', code: r.code, playerId: p.id, token: p.token, name: p.name, resumed: true });
             broadcastRoster(r);
+            replayKept(r, p);
             return;
         }
         case 'leave': {
@@ -169,6 +177,26 @@ function handle(ws, m) {
             }
             room.players.delete(ws.pid); ws.room = null;
             sendGmState(room); broadcastRoster(room);
+            return;
+        }
+        // ---------------- TIN RIÊNG (Giai đoạn 2) ----------------
+        case 'to': {   // quản trò -> 1 người chơi
+            if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò mới gửi được');
+            const p = room.players.get(m.to); if (!p || !m.data || typeof m.data !== 'object') return;
+            if (typeof m.keep === 'string' && KEEP_RE.test(m.keep)) { p.kept = p.kept || {}; p.kept[m.keep] = m.data; }
+            send(p.ws, { t: 'msg', from: 'gm', data: m.data }); touch(room);
+            return;
+        }
+        case 'all': {  // quản trò -> cả phòng (chỉ dùng cho tin công khai)
+            if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò mới gửi được');
+            if (!m.data || typeof m.data !== 'object') return;
+            if (typeof m.keep === 'string' && KEEP_RE.test(m.keep)) room.keptAll[m.keep] = m.data;
+            for (const p of room.players.values()) send(p.ws, { t: 'msg', from: 'gm', data: m.data });
+            touch(room); return;
+        }
+        case 'to_gm': { // người chơi -> quản trò
+            if (!room || ws.role !== 'player' || !m.data || typeof m.data !== 'object') return;
+            send(room.gm, { t: 'msg', from: ws.pid, data: m.data }); touch(room);
             return;
         }
         case 'ping': return send(ws, { t: 'pong' });
@@ -181,7 +209,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
     res.end(`Lang Xi Nghiep No server OK — ${rooms.size} phòng\n`);
 });
-const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
+const wss = new WebSocketServer({ server, maxPayload: 64 * 1024 }); // đủ cho lá bài kèm biểu tượng
 
 wss.on('connection', (ws) => {
     ws.isAlive = true;
