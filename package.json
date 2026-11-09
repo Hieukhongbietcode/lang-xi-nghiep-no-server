@@ -1,0 +1,16 @@
+{
+  "name": "lang-xi-nghiep-no-server",
+  "version": "1.0.0",
+  "description": "Server phòng chơi online cho Làng Xí Nghiệp Nợ",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  },
+  "license": "MIT"
+}
