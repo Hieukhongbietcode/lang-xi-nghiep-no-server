@@ -1,11 +1,13 @@
 // =====================================================================
-//  Làng Xí Nghiệp Nợ — server phòng chơi online (Giai đoạn 1: sảnh chờ · Giai đoạn 2: chia bài)
+//  Làng Xí Nghiệp Nợ — server phòng chơi online (GĐ1: sảnh chờ · GĐ2: chia bài · GĐ3: chat)
 //  - Quản trò tạo phòng, người chơi vào bằng tên + mã phòng
 //  - Khoá phòng khi quản trò bắt đầu: người MỚI bị từ chối, người CŨ vẫn vào lại được
 //  - Rớt mạng thì tự vào lại bằng mã định danh (token) lưu trên máy
 //  - Server KHÔNG giữ dữ liệu ván: máy quản trò giữ hết. Server khởi động lại thì
 //    máy quản trò tự dựng lại phòng (restore).
 //  - Tin riêng (lá bài...) CHỈ gửi tới đúng người nhận, không bao giờ gửi cả phòng.
+//  - Chat: quản trò báo "ai được nói ở kênh nào" theo từng bước; server tự chặn tin sai lượt
+//    và chỉ gửi tin tới đúng người được phép đọc.
 // =====================================================================
 const http = require('http');
 const crypto = require('crypto');
@@ -37,7 +39,7 @@ const normName = (n) => String(n || '').replace(/\s+/g, ' ').trim().slice(0, MAX
 const nameKey = (n) => normName(n).toLocaleLowerCase('vi');
 
 function makeRoom(code, gmToken) {
-    return { code, gmToken, gm: null, locked: false, players: new Map(), keptAll: {}, createdAt: Date.now(), lastActive: Date.now() };
+    return { code, gmToken, gm: null, locked: false, players: new Map(), keptAll: {}, perm: emptyPerm(), label: '', log: [], createdAt: Date.now(), lastActive: Date.now() };
 }
 function send(ws, obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 function rosterOf(room) {
@@ -81,6 +83,31 @@ function replayKept(room, p) {
 }
 const KEEP_RE = /^[a-z_]{1,20}$/;
 
+// ---------------- CHAT (Giai đoạn 3) ----------------
+const CHANNELS = ['public', 'wolves', 'couple', 'dead', 'dm'];
+const CHAT_MAX = 300, CHAT_RATE = 6, CHAT_WINDOW = 10000, LOG_MAX = 600;
+function emptyPerm() { const p = {}; CHANNELS.forEach(c => p[c] = new Set()); return p; }
+function permFor(room, pid) {
+    const can = {}; CHANNELS.forEach(c => can[c] = room.perm[c].has(pid)); return can;
+}
+function sendPerm(room, p) { send(p.ws, { t: 'chat_perm', can: permFor(room, p.id), label: room.label || '' }); }
+// Ai được nhận tin ở kênh này (người chơi). Quản trò luôn nhận.
+function readersOf(room, ch, pid) {
+    if (ch === 'public') return [...room.players.keys()];       // cả làng (kể cả người chết) đọc được kênh Làng
+    if (ch === 'dm') return pid ? [pid] : [];                   // nhắn riêng: chỉ người đó + quản trò
+    return [...room.perm[ch]];                                   // Sói / Cặp đôi / Người chết: chỉ thành viên kênh
+}
+function deliverChat(room, msg, readers) {
+    msg.to = readers;
+    room.log.push(msg); if (room.log.length > LOG_MAX) room.log.splice(0, room.log.length - LOG_MAX);
+    const out = { t: 'chat', m: publicMsg(msg) };
+    send(room.gm, out);
+    for (const id of readers) { const p = room.players.get(id); if (p) send(p.ws, out); }
+}
+function publicMsg(m) { return { id: m.id, ch: m.ch, from: m.from, name: m.name, text: m.text, ts: m.ts, dm: m.dm }; }
+function historyFor(room, pid) { return room.log.filter(m => pid === 'gm' || m.to.includes(pid)).map(publicMsg); }
+function cleanText(t) { return String(t || '').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').replace(/\s+\n/g, '\n').trim().slice(0, CHAT_MAX); }
+
 function handle(ws, m) {
     const room = ws.room ? rooms.get(ws.room) : null;
     switch (m.t) {
@@ -100,6 +127,7 @@ function handle(ws, m) {
             attachGm(r, ws);
             send(ws, { t: 'gm_ok', code: r.code });
             sendGmState(r); broadcastRoster(r);
+            send(ws, { t: 'chat_hist', list: historyFor(r, 'gm') });
             return;
         }
         case 'restore': { // server đã khởi động lại: quản trò dựng lại phòng từ dữ liệu trên máy
@@ -168,6 +196,8 @@ function handle(ws, m) {
             send(ws, { t: 'joined', code: r.code, playerId: p.id, token: p.token, name: p.name, resumed: true });
             broadcastRoster(r);
             replayKept(r, p);
+            sendPerm(r, p);
+            send(ws, { t: 'chat_hist', list: historyFor(r, p.id) });
             return;
         }
         case 'leave': {
@@ -198,6 +228,34 @@ function handle(ws, m) {
             if (!room || ws.role !== 'player' || !m.data || typeof m.data !== 'object') return;
             send(room.gm, { t: 'msg', from: ws.pid, data: m.data }); touch(room);
             return;
+        }
+        case 'perm': {   // quản trò báo ai được nói ở kênh nào (gửi lại mỗi khi đổi bước)
+            if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò mới đặt quyền chat');
+            const np = emptyPerm();
+            CHANNELS.forEach(c => (Array.isArray(m.perm && m.perm[c]) ? m.perm[c] : []).forEach(id => { if (room.players.has(id)) np[c].add(id); }));
+            room.perm = np; room.label = String(m.label || '').slice(0, 80);
+            for (const p of room.players.values()) sendPerm(room, p);
+            return;
+        }
+        case 'chat': {
+            if (!room) return;
+            const ch = CHANNELS.includes(m.ch) ? m.ch : null; if (!ch) return err(ws, 'BAD_CH', 'Kênh không hợp lệ');
+            const text = cleanText(m.text); if (!text) return;
+            const now = Date.now();
+            ws.chatTimes = (ws.chatTimes || []).filter(t => now - t < CHAT_WINDOW);
+            if (ws.chatTimes.length >= CHAT_RATE) return err(ws, 'CHAT_SLOW', 'Bạn nhắn nhanh quá, chờ vài giây');
+            ws.chatTimes.push(now);
+            const id = 'm' + rnd(6);
+            if (ws.role === 'gm' && room.gm === ws) {
+                if (ch === 'dm' && !room.players.has(m.to)) return err(ws, 'BAD_TO', 'Không tìm thấy người nhận');
+                deliverChat(room, { id, ch, from: 'gm', name: 'Quản trò', text, ts: now, dm: ch === 'dm' ? m.to : undefined }, readersOf(room, ch, m.to));
+                return;
+            }
+            if (ws.role !== 'player') return;
+            const p = room.players.get(ws.pid); if (!p) return;
+            if (!room.perm[ch].has(p.id)) return err(ws, 'CHAT_LOCKED', 'Chưa tới lượt bạn chat ở kênh này');
+            deliverChat(room, { id, ch, from: p.id, name: p.name, text, ts: now, dm: ch === 'dm' ? p.id : undefined }, readersOf(room, ch, p.id));
+            touch(room); return;
         }
         case 'ping': return send(ws, { t: 'pong' });
         default: return err(ws, 'UNKNOWN', 'Lệnh không hợp lệ');
