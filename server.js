@@ -39,16 +39,18 @@ const normName = (n) => String(n || '').replace(/\s+/g, ' ').trim().slice(0, MAX
 const nameKey = (n) => normName(n).toLocaleLowerCase('vi');
 
 function makeRoom(code, gmToken) {
-    return { code, gmToken, gm: null, locked: false, players: new Map(), keptAll: {}, perm: emptyPerm(), label: '', log: [], createdAt: Date.now(), lastActive: Date.now() };
+    return { code, gmToken, gm: null, locked: false, final: false, players: new Map(), spec: new Map(), knocks: new Map(), keptAll: {}, perm: emptyPerm(), label: '', log: [], createdAt: Date.now(), lastActive: Date.now() };
 }
 function send(ws, obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 function rosterOf(room) {
-    return [...room.players.values()].map(p => ({ id: p.id, name: p.name, online: !!(p.ws && p.ws.readyState === 1) }));
+    return [...room.players.values()].map(p => ({ id: p.id, name: p.name, online: !!(p.ws && p.ws.readyState === 1), off: p.offSince || 0 }));
 }
+function specOf(room) { return [...room.spec.values()].map(p => ({ id: p.id, name: p.name, online: !!(p.ws && p.ws.readyState === 1) })); }
 function broadcastRoster(room) {
-    const msg = { t: 'roster', code: room.code, locked: room.locked, gmOnline: !!(room.gm && room.gm.readyState === 1), players: rosterOf(room) };
+    const msg = { t: 'roster', code: room.code, locked: room.locked, final: room.final, gmOnline: !!(room.gm && room.gm.readyState === 1), players: rosterOf(room), spec: specOf(room) };
     send(room.gm, msg);
     for (const p of room.players.values()) send(p.ws, msg);
+    for (const p of room.spec.values()) send(p.ws, msg);
 }
 // Thông tin đầy đủ (kèm token) chỉ gửi cho quản trò, để quản trò dựng lại phòng nếu server khởi động lại
 function gmRoster(room) {
@@ -72,7 +74,7 @@ function attachPlayer(room, p, ws) {
         send(p.ws, { t: 'replaced' }); // cùng người mở ở tab/máy khác
         try { p.ws.close(4000, 'replaced'); } catch (e) {}
     }
-    p.ws = ws; ws.role = 'player'; ws.room = room.code; ws.pid = p.id;
+    p.ws = ws; ws.role = 'player'; ws.room = room.code; ws.pid = p.id; p.offSince = 0;
     touch(room);
 }
 function err(ws, code, msg) { send(ws, { t: 'error', code, msg }); }
@@ -89,12 +91,15 @@ const EMOJIS = ['👍', '❤️', '👎', '🤔', '😂', '😭', '😠'];
 const CHAT_MAX = 300, CHAT_RATE = 6, CHAT_WINDOW = 10000, LOG_MAX = 600;
 function emptyPerm() { const p = {}; CHANNELS.forEach(c => p[c] = new Set()); return p; }
 function permFor(room, pid) {
-    const can = {}; CHANNELS.forEach(c => can[c] = room.perm[c].has(pid)); return can;
+    const can = {}; CHANNELS.forEach(c => can[c] = room.perm[c].has(pid));
+    if (!room.locked && room.players.has(pid)) can.public = true;   // sảnh chờ: chat tự do
+    return can;
 }
+const canWrite = (room, ch, pid) => room.perm[ch].has(pid) || (ch === 'public' && !room.locked && room.players.has(pid));
 function sendPerm(room, p) { send(p.ws, { t: 'chat_perm', can: permFor(room, p.id), label: room.label || '', slow: room.slow || 0 }); }
 // Ai được nhận tin ở kênh này (người chơi). Quản trò luôn nhận.
 function readersOf(room, ch, pid) {
-    if (ch === 'public') return [...room.players.keys()];       // cả làng (kể cả người chết) đọc được kênh Làng
+    if (ch === 'public') return [...room.players.keys(), ...room.spec.keys()]; // cả làng (kể cả người chết) + khán giả đọc được kênh Làng
     if (ch === 'dm') return pid ? [pid] : [];                   // nhắn riêng: chỉ người đó + quản trò
     if (ch === 'muted') return [...new Set([...room.perm.muted, ...room.perm.dead])]; // bị cấm nói: chỉ người bị cấm + người chết (+ quản trò)
     return [...room.perm[ch]];                                   // Sói / Cặp đôi / Người chết: chỉ thành viên kênh
@@ -104,8 +109,9 @@ function deliverChat(room, msg, readers) {
     room.log.push(msg); if (room.log.length > LOG_MAX) room.log.splice(0, room.log.length - LOG_MAX);
     const out = { t: 'chat', m: publicMsg(msg) };
     send(room.gm, out);
-    for (const id of readers) { const p = room.players.get(id); if (p) send(p.ws, out); }
+    for (const id of readers) { const p = member(room, id); if (p) send(p.ws, out); }
 }
+function member(room, id) { return room.players.get(id) || room.spec.get(id); }
 function publicMsg(m) { return { id: m.id, ch: m.ch, from: m.from, name: m.name, text: m.text, ts: m.ts, dm: m.dm, r: reactOut(m) }; }
 function reactOut(m) { if (!m.react) return undefined; const o = {}; for (const [e, set] of Object.entries(m.react)) if (set.size) o[e] = [...set]; return Object.keys(o).length ? o : undefined; }
 function historyFor(room, pid) { return room.log.filter(m => pid === 'gm' || m.to.includes(pid)).map(publicMsg); }
@@ -157,7 +163,7 @@ function handle(ws, m) {
         case 'close': {
             if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò mới làm được');
             touch(room);
-            if (m.t === 'lock') { room.locked = !!m.locked; sendGmState(room); broadcastRoster(room); return; }
+            if (m.t === 'lock') { room.locked = !!m.locked; if (!room.locked) room.final = false; sendGmState(room); broadcastRoster(room); for (const p of room.players.values()) sendPerm(room, p); return; }
             if (m.t === 'kick') {
                 if (room.locked) return err(ws, 'LOCKED', 'Phòng đã khoá, không mời ra được');
                 const p = room.players.get(m.playerId); if (!p) return;
@@ -167,7 +173,7 @@ function handle(ws, m) {
                 sendGmState(room); broadcastRoster(room); return;
             }
             // close
-            for (const p of room.players.values()) { send(p.ws, { t: 'room_closed' }); if (p.ws) p.ws.room = null; }
+            for (const p of [...room.players.values(), ...room.spec.values()]) { send(p.ws, { t: 'room_closed' }); if (p.ws) p.ws.room = null; }
             rooms.delete(room.code); ws.room = null;
             send(ws, { t: 'closed' });
             return;
@@ -179,22 +185,42 @@ function handle(ws, m) {
             ws.joinTries.push(Date.now());
             const r = rooms.get(normCode(m.code));
             if (!r) return err(ws, 'NO_ROOM', 'Không tìm thấy phòng. Kiểm tra lại mã phòng.');
-            if (r.locked) return err(ws, 'LOCKED', 'Game đã được bắt đầu');
             const name = normName(m.name);
             if (!name) return err(ws, 'BAD_NAME', 'Hãy nhập tên hiển thị');
-            if ([...r.players.values()].some(p => nameKey(p.name) === nameKey(name))) return err(ws, 'NAME_TAKEN', `Tên "${name}" đã có người dùng trong phòng`);
+            if ([...r.players.values(), ...r.spec.values()].some(p => nameKey(p.name) === nameKey(name))) return err(ws, 'NAME_TAKEN', `Tên "${name}" đã có người dùng trong phòng`);
+            if (m.spectate) {          // khán giả: vào lúc nào cũng được, không có bài, không nói được
+                const sp = { id: 's' + rnd(6), name, token: rnd(16), ws: null, spec: true };
+                r.spec.set(sp.id, sp); sp.ws = ws; ws.role = 'spec'; ws.room = r.code; ws.pid = sp.id; touch(r);
+                send(ws, { t: 'joined', code: r.code, playerId: sp.id, token: sp.token, name: sp.name, spec: true });
+                broadcastRoster(r); replayKept(r, sp); send(ws, { t: 'chat_hist', list: historyFor(r, sp.id) });
+                return;
+            }
+            if (r.final) return err(ws, 'LOCKED_FINAL', 'Ván đã chia bài — không thể vào chơi nữa. Bạn có thể vào xem.');
+            if (r.locked) {            // đã khoá nhưng chưa chia bài: xin quản trò duyệt
+                if (!m.knock) return err(ws, 'LOCKED_KNOCK', 'Phòng đã khoá. Bạn có thể xin quản trò cho vào chơi.');
+                const reqId = 'k' + rnd(4); r.knocks.set(reqId, { ws, name, at: Date.now() }); ws.knockId = reqId; ws.room = r.code; ws.role = 'knock';
+                send(r.gm, { t: 'knock', reqId, name }); send(ws, { t: 'knock_wait', name });
+                return;
+            }
             if (r.players.size >= MAX_PLAYERS) return err(ws, 'FULL', 'Phòng đã đủ người');
             const p = { id: 'u' + rnd(6), name, token: rnd(16), ws: null };
             r.players.set(p.id, p); attachPlayer(r, p, ws);
             send(ws, { t: 'joined', code: r.code, playerId: p.id, token: p.token, name: p.name });
-            sendGmState(r); broadcastRoster(r);
+            sendGmState(r); broadcastRoster(r); sendPerm(r, p);
             return;
         }
         case 'resume': {
             const r = rooms.get(normCode(m.code));
             if (!r) return err(ws, 'NO_ROOM_RESUME', 'Phòng không còn trên server');
             const p = [...r.players.values()].find(x => x.token === m.token);
-            if (!p) return err(ws, 'NOT_MEMBER', 'Bạn không còn trong phòng này');
+            if (!p) {                  // khán giả vào lại
+                const sp = [...r.spec.values()].find(x => x.token === m.token);
+                if (!sp) return err(ws, 'NOT_MEMBER', 'Bạn không còn trong phòng này');
+                sp.ws = ws; ws.role = 'spec'; ws.room = r.code; ws.pid = sp.id; touch(r);
+                send(ws, { t: 'joined', code: r.code, playerId: sp.id, token: sp.token, name: sp.name, spec: true, resumed: true });
+                broadcastRoster(r); replayKept(r, sp); send(ws, { t: 'chat_hist', list: historyFor(r, sp.id) });
+                return;
+            }
             attachPlayer(r, p, ws); // phòng đã khoá vẫn cho người CŨ vào lại
             send(ws, { t: 'joined', code: r.code, playerId: p.id, token: p.token, name: p.name, resumed: true });
             broadcastRoster(r);
@@ -256,7 +282,7 @@ function handle(ws, m) {
             }
             if (ws.role !== 'player') return;
             const p = room.players.get(ws.pid); if (!p) return;
-            if (!room.perm[ch].has(p.id)) return err(ws, 'CHAT_LOCKED', 'Chưa tới lượt bạn chat ở kênh này');
+            if (!canWrite(room, ch, p.id)) return err(ws, 'CHAT_LOCKED', 'Chưa tới lượt bạn chat ở kênh này');
             if (ch === 'public' && room.slow) {
                 const wait = (p.lastPublic || 0) + room.slow * 1000 - now;
                 if (wait > 0) return err(ws, 'CHAT_SLOW', `🐢 Chế độ chậm: chờ ${Math.ceil(wait / 1000)} giây nữa`);
@@ -284,13 +310,30 @@ function handle(ws, m) {
         }
         case 'react': {  // thả biểu cảm dưới tin kênh Làng (bấm lần nữa để bỏ)
             if (!room || ws.role !== 'player' || !EMOJIS.includes(m.emo)) return;
-            if (!room.perm.public.has(ws.pid)) return err(ws, 'CHAT_LOCKED', 'Chỉ thả biểu cảm được khi làng đang thảo luận');
+            if (!canWrite(room, 'public', ws.pid)) return err(ws, 'CHAT_LOCKED', 'Chỉ thả biểu cảm được khi làng đang thảo luận');
             const msg = room.log.find(x => x.id === m.id); if (!msg || msg.ch !== 'public') return;
             msg.react = msg.react || {}; const set = msg.react[m.emo] = msg.react[m.emo] || new Set();
             set.has(ws.pid) ? set.delete(ws.pid) : set.add(ws.pid);
             const out = { t: 'react', id: msg.id, r: reactOut(msg) || {} };
-            send(room.gm, out); for (const id of msg.to) { const q = room.players.get(id); if (q) send(q.ws, out); }
+            send(room.gm, out); for (const id of msg.to) { const q = member(room, id); if (q) send(q.ws, out); }
             return;
+        }
+        case 'admit': {   // quản trò duyệt người xin vào
+            if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò');
+            const k = room.knocks.get(m.reqId); if (!k) return; room.knocks.delete(m.reqId); k.ws.knockId = null;
+            if (!m.ok || room.final) { send(k.ws, { t: 'error', code: 'KNOCK_DENIED', msg: room.final ? 'Ván đã chia bài — không thể vào chơi nữa' : 'Quản trò chưa cho vào phòng' }); return; }
+            if ([...room.players.values()].some(p => nameKey(p.name) === nameKey(k.name))) { send(k.ws, { t: 'error', code: 'NAME_TAKEN', msg: `Tên "${k.name}" đã có người dùng` }); return; }
+            const p = { id: 'u' + rnd(6), name: k.name, token: rnd(16), ws: null };
+            room.players.set(p.id, p); attachPlayer(room, p, k.ws);
+            send(k.ws, { t: 'joined', code: room.code, playerId: p.id, token: p.token, name: p.name });
+            sendGmState(room); broadcastRoster(room); replayKept(room, p); sendPerm(room, p);
+            return;
+        }
+        case 'final': {   // quản trò đã chia bài -> không ai vào chơi được nữa (chỉ vào xem)
+            if (!room || ws.role !== 'gm' || room.gm !== ws) return;
+            room.final = !!m.on;
+            if (room.final) for (const [id, k] of room.knocks) { send(k.ws, { t: 'error', code: 'KNOCK_DENIED', msg: 'Ván đã chia bài — không thể vào chơi nữa' }); room.knocks.delete(id); }
+            broadcastRoster(room); return;
         }
         case 'ping': return send(ws, { t: 'pong' });
         default: return err(ws, 'UNKNOWN', 'Lệnh không hợp lệ');
@@ -306,7 +349,7 @@ const wss = new WebSocketServer({ server, maxPayload: 64 * 1024 }); // đủ cho
 
 wss.on('connection', (ws) => {
     ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
+    ws.on('pong', () => { ws.isAlive = true; if (ws.pingAt) ws.rtt = Date.now() - ws.pingAt; });
     ws.on('message', (data) => {
         let m; try { m = JSON.parse(data); } catch (e) { return err(ws, 'BAD_JSON', 'Dữ liệu không hợp lệ'); }
         if (!m || typeof m.t !== 'string') return;
@@ -316,7 +359,9 @@ wss.on('connection', (ws) => {
         const room = ws.room ? rooms.get(ws.room) : null;
         if (!room) return;
         if (ws.role === 'gm' && room.gm === ws) room.gm = null;
-        if (ws.role === 'player') { const p = room.players.get(ws.pid); if (p && p.ws === ws) p.ws = null; }
+        if (ws.role === 'player') { const p = room.players.get(ws.pid); if (p && p.ws === ws) { p.ws = null; p.offSince = Date.now(); } }
+        if (ws.role === 'spec') { const p = room.spec.get(ws.pid); if (p && p.ws === ws) p.ws = null; }
+        if (ws.knockId) { room.knocks.delete(ws.knockId); send(room.gm, { t: 'knock_gone', reqId: ws.knockId }); }
         broadcastRoster(room);
     });
 });
@@ -325,9 +370,12 @@ wss.on('connection', (ws) => {
 setInterval(() => {
     for (const ws of wss.clients) {
         if (!ws.isAlive) { try { ws.terminate(); } catch (e) {} continue; }
-        ws.isAlive = false; try { ws.ping(); } catch (e) {}
+        ws.isAlive = false; ws.pingAt = Date.now(); try { ws.ping(); } catch (e) {}
     }
-}, 20000);
+    // báo quản trò chất lượng mạng của từng người chơi
+    setTimeout(() => { for (const r of rooms.values()) if (r.gm && r.gm.readyState === 1)
+        send(r.gm, { t: 'net', list: [...r.players.values()].map(p => ({ id: p.id, rtt: p.ws && p.ws.readyState === 1 ? (p.ws.rtt || 0) : -1, off: p.offSince || 0 })) }); }, 3000);
+}, 15000);
 // Dọn phòng bỏ hoang
 setInterval(() => {
     const now = Date.now();
