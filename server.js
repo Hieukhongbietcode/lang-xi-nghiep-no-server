@@ -84,17 +84,19 @@ function replayKept(room, p) {
 const KEEP_RE = /^[a-z_]{1,20}$/;
 
 // ---------------- CHAT (Giai đoạn 3) ----------------
-const CHANNELS = ['public', 'wolves', 'couple', 'dead', 'dm'];
+const CHANNELS = ['public', 'wolves', 'couple', 'dead', 'dm', 'muted'];
+const EMOJIS = ['👍', '❤️', '👎', '🤔', '😂', '😭', '😠'];
 const CHAT_MAX = 300, CHAT_RATE = 6, CHAT_WINDOW = 10000, LOG_MAX = 600;
 function emptyPerm() { const p = {}; CHANNELS.forEach(c => p[c] = new Set()); return p; }
 function permFor(room, pid) {
     const can = {}; CHANNELS.forEach(c => can[c] = room.perm[c].has(pid)); return can;
 }
-function sendPerm(room, p) { send(p.ws, { t: 'chat_perm', can: permFor(room, p.id), label: room.label || '' }); }
+function sendPerm(room, p) { send(p.ws, { t: 'chat_perm', can: permFor(room, p.id), label: room.label || '', slow: room.slow || 0 }); }
 // Ai được nhận tin ở kênh này (người chơi). Quản trò luôn nhận.
 function readersOf(room, ch, pid) {
     if (ch === 'public') return [...room.players.keys()];       // cả làng (kể cả người chết) đọc được kênh Làng
     if (ch === 'dm') return pid ? [pid] : [];                   // nhắn riêng: chỉ người đó + quản trò
+    if (ch === 'muted') return [...new Set([...room.perm.muted, ...room.perm.dead])]; // bị cấm nói: chỉ người bị cấm + người chết (+ quản trò)
     return [...room.perm[ch]];                                   // Sói / Cặp đôi / Người chết: chỉ thành viên kênh
 }
 function deliverChat(room, msg, readers) {
@@ -104,7 +106,8 @@ function deliverChat(room, msg, readers) {
     send(room.gm, out);
     for (const id of readers) { const p = room.players.get(id); if (p) send(p.ws, out); }
 }
-function publicMsg(m) { return { id: m.id, ch: m.ch, from: m.from, name: m.name, text: m.text, ts: m.ts, dm: m.dm }; }
+function publicMsg(m) { return { id: m.id, ch: m.ch, from: m.from, name: m.name, text: m.text, ts: m.ts, dm: m.dm, r: reactOut(m) }; }
+function reactOut(m) { if (!m.react) return undefined; const o = {}; for (const [e, set] of Object.entries(m.react)) if (set.size) o[e] = [...set]; return Object.keys(o).length ? o : undefined; }
 function historyFor(room, pid) { return room.log.filter(m => pid === 'gm' || m.to.includes(pid)).map(publicMsg); }
 function cleanText(t) { return String(t || '').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').replace(/\s+\n/g, '\n').trim().slice(0, CHAT_MAX); }
 
@@ -254,8 +257,40 @@ function handle(ws, m) {
             if (ws.role !== 'player') return;
             const p = room.players.get(ws.pid); if (!p) return;
             if (!room.perm[ch].has(p.id)) return err(ws, 'CHAT_LOCKED', 'Chưa tới lượt bạn chat ở kênh này');
+            if (ch === 'public' && room.slow) {
+                const wait = (p.lastPublic || 0) + room.slow * 1000 - now;
+                if (wait > 0) return err(ws, 'CHAT_SLOW', `🐢 Chế độ chậm: chờ ${Math.ceil(wait / 1000)} giây nữa`);
+                p.lastPublic = now;
+            }
             deliverChat(room, { id, ch, from: p.id, name: p.name, text, ts: now, dm: ch === 'dm' ? p.id : undefined }, readersOf(room, ch, p.id));
             touch(room); return;
+        }
+        case 'slow': {  // quản trò bật/tắt chế độ chậm cho kênh Làng
+            if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò');
+            room.slow = Math.max(0, Math.min(60, parseInt(m.sec, 10) || 0));
+            for (const p of room.players.values()) sendPerm(room, p);
+            send(ws, { t: 'slow_ok', sec: room.slow });
+            return;
+        }
+        case 'typing': { // "đang gõ…" — chỉ ở kênh riêng, chỉ người có quyền viết kênh đó
+            if (!room || ws.role !== 'player') return;
+            const ch = m.ch; if (!['dm', 'wolves', 'couple', 'dead', 'muted'].includes(ch) || !room.perm[ch].has(ws.pid)) return;
+            const now = Date.now(); if (now - (ws.lastTyping || 0) < 1500) return; ws.lastTyping = now;
+            const p = room.players.get(ws.pid); if (!p) return;
+            const out = { t: 'typing', ch, from: p.id, name: p.name };
+            send(room.gm, out);
+            if (ch !== 'dm') for (const id of readersOf(room, ch, p.id)) { if (id !== p.id) { const q = room.players.get(id); if (q) send(q.ws, out); } }
+            return;
+        }
+        case 'react': {  // thả biểu cảm dưới tin kênh Làng (bấm lần nữa để bỏ)
+            if (!room || ws.role !== 'player' || !EMOJIS.includes(m.emo)) return;
+            if (!room.perm.public.has(ws.pid)) return err(ws, 'CHAT_LOCKED', 'Chỉ thả biểu cảm được khi làng đang thảo luận');
+            const msg = room.log.find(x => x.id === m.id); if (!msg || msg.ch !== 'public') return;
+            msg.react = msg.react || {}; const set = msg.react[m.emo] = msg.react[m.emo] || new Set();
+            set.has(ws.pid) ? set.delete(ws.pid) : set.add(ws.pid);
+            const out = { t: 'react', id: msg.id, r: reactOut(msg) || {} };
+            send(room.gm, out); for (const id of msg.to) { const q = room.players.get(id); if (q) send(q.ws, out); }
+            return;
         }
         case 'ping': return send(ws, { t: 'pong' });
         default: return err(ws, 'UNKNOWN', 'Lệnh không hợp lệ');
