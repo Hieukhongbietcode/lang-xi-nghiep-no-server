@@ -123,14 +123,18 @@ function readersOf(room, ch, pid) {
 function deliverChat(room, msg, readers) {
     msg.to = readers;
     room.log.push(msg); if (room.log.length > LOG_MAX) room.log.splice(0, room.log.length - LOG_MAX);
+    if (msg.audio) { const withAudio = room.log.filter(x => x.audio); withAudio.slice(0, Math.max(0, withAudio.length - AUDIO_KEEP)).forEach(x => { x.audio = undefined; x.gone = true; x.text = '🎤 Tin nhắn thoại (đã hết hạn)'; }); }
     const out = { t: 'chat', m: publicMsg(msg) };
     send(room.gm, out);
     for (const id of readers) { const p = member(room, id); if (p) send(p.ws, out); }
 }
 function member(room, id) { return room.players.get(id) || room.spec.get(id); }
-function publicMsg(m) { return { id: m.id, ch: m.ch, from: m.from, name: m.name, text: m.text, ts: m.ts, dm: m.dm, r: reactOut(m), cid: m.cid }; }
+function publicMsg(m) { return { id: m.id, ch: m.ch, from: m.from, name: m.name, text: m.text, ts: m.ts, dm: m.dm, r: reactOut(m), cid: m.cid, audio: m.audio, dur: m.dur, gone: m.gone }; }
+// Tin nhắn thoại: chỉ nhận âm thanh base64 hợp lệ, tối đa ~300 KB (khoảng 30 giây ở chất lượng thoại)
+const AUDIO_MAX = 300 * 1024, AUDIO_KEEP = 20;
+function okAudio(a) { return typeof a === 'string' && a.length <= AUDIO_MAX && /^data:audio\/(webm|ogg|mp4|mpeg|aac|x-m4a)(;[a-z0-9=.,-]+)*;base64,[A-Za-z0-9+/=]+$/i.test(a); }
 function reactOut(m) { if (!m.react) return undefined; const o = {}; for (const [e, set] of Object.entries(m.react)) if (set.size) o[e] = [...set]; return Object.keys(o).length ? o : undefined; }
-function historyFor(room, pid) { return room.log.filter(m => pid === 'gm' || m.to.includes(pid)).map(publicMsg); }
+function historyFor(room, pid) { const spec = room.spec && room.spec.has(pid); return room.log.filter(m => pid === 'gm' || m.to.includes(pid) || (spec && m.ch === 'public')).map(publicMsg); }   // khán giả xem lại toàn bộ kênh Làng (công khai)
 function cleanText(t, max) { return String(t || '').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').replace(/\s+\n/g, '\n').trim().slice(0, max || CHAT_MAX); }
 
 function handle(ws, m) {
@@ -288,7 +292,9 @@ function handle(ws, m) {
             if (!room) return;
             const ch = CHANNELS.includes(m.ch) ? m.ch : null; if (!ch) return err(ws, 'BAD_CH', 'Kênh không hợp lệ');
             ws._cid = typeof m.cid === 'string' ? m.cid.slice(0, 24) : undefined;   // để máy gửi khớp tin hiện trước (cập nhật lạc quan)
-            const text = cleanText(m.text, ws.role === 'gm' ? 1500 : CHAT_MAX); if (!text) return;   // quản trò được dài hơn (danh sách người chết)
+            const audio = okAudio(m.audio) ? m.audio : undefined, dur = audio ? Math.max(1, Math.min(30, Math.round(+m.dur || 1))) : undefined;
+            if (m.audio && !audio) return err(ws, 'CHAT_AUDIO', 'Tin nhắn thoại không hợp lệ hoặc quá dài (tối đa 30 giây)');
+            const text = audio ? '🎤 Tin nhắn thoại' : cleanText(m.text, ws.role === 'gm' ? 1500 : CHAT_MAX); if (!text) return;   // quản trò được dài hơn (danh sách người chết)
             const now = Date.now();
             ws.chatTimes = (ws.chatTimes || []).filter(t => now - t < CHAT_WINDOW);
             if (ws.chatTimes.length >= (ws.role === 'gm' ? 40 : CHAT_RATE)) return err(ws, 'CHAT_SLOW', 'Bạn nhắn nhanh quá, chờ vài giây'); // quản trò: 40 tin/10s (thông báo tự động dồn lúc trời sáng)
@@ -299,7 +305,7 @@ function handle(ws, m) {
                 // Quản trò nhắn phòng Sói / Cặp Đôi ngoài lượt: gửi tới đúng danh sách quản trò chỉ định (người đã từng thức trong phòng đó)
                 let readers = readersOf(room, ch, m.to);
                 if ((ch === 'wolves' || ch === 'couple') && Array.isArray(m.readers)) readers = [...new Set([...readers, ...m.readers.filter(x => room.players.has(x))])];
-                deliverChat(room, { id, ch, from: 'gm', name: 'Quản trò', text, ts: now, dm: ch === 'dm' ? m.to : undefined, cid: ws._cid }, readers);
+                deliverChat(room, { id, ch, from: 'gm', name: 'Quản trò', text, ts: now, dm: ch === 'dm' ? m.to : undefined, cid: ws._cid, audio, dur }, readers);
                 return;
             }
             if (ws.role !== 'player') return;
@@ -310,7 +316,7 @@ function handle(ws, m) {
                 if (wait > 0) return err(ws, 'CHAT_SLOW', `🐢 Chế độ chậm: chờ ${Math.ceil(wait / 1000)} giây nữa`);
                 p.lastPublic = now;
             }
-            deliverChat(room, { id, ch, from: p.id, name: p.name, text, ts: now, cid: ws._cid, dm: ch === 'dm' ? p.id : undefined }, readersOf(room, ch, p.id));
+            deliverChat(room, { id, ch, from: p.id, name: p.name, text, ts: now, cid: ws._cid, dm: ch === 'dm' ? p.id : undefined, audio, dur }, readersOf(room, ch, p.id));
             touch(room); return;
         }
         case 'slow': {  // quản trò bật/tắt chế độ chậm cho kênh Làng
@@ -388,7 +394,7 @@ wss.on('connection', (ws) => {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; if (ws.pingAt) ws.rtt = Date.now() - ws.pingAt; });
     ws.on('message', (data) => {
-        if (data.length > 64 * 1024 && ws.role !== 'gm') { try { ws.close(1009, 'too big'); } catch (e) {} return; }
+        if (data.length > (ws.role === 'gm' ? Infinity : data.length <= 320 * 1024 && /"t"\s*:\s*"chat"/.test(String(data).slice(0, 40)) ? 320 * 1024 : 64 * 1024)) { try { ws.close(1009, 'too big'); } catch (e) {} return; }
         let m; try { m = JSON.parse(data); } catch (e) { return err(ws, 'BAD_JSON', 'Dữ liệu không hợp lệ'); }
         if (!m || typeof m.t !== 'string') return;
         try { handle(ws, m); } catch (e) { console.error(e); err(ws, 'SERVER', 'Lỗi server'); }
