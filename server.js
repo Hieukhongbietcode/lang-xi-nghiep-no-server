@@ -78,7 +78,8 @@ function attachPlayer(room, p, ws) {
     p.ws = ws; ws.role = 'player'; ws.room = room.code; ws.pid = p.id; p.offSince = 0;
     touch(room);
 }
-function err(ws, code, msg) { send(ws, { t: 'error', code, msg }); }
+function err(ws, code, msg) {
+    if (/^CHAT_/.test(code) && ws && ws._cid) { send(ws, { t: 'error', code, msg, cid: ws._cid }); return; } send(ws, { t: 'error', code, msg }); }
 // Gửi lại các tin quản trò đã "giữ" (lá bài, trạng thái ván) cho người vừa vào lại
 function replayKept(room, p) {
     for (const data of Object.values(room.keptAll || {})) send(p.ws, { t: 'msg', from: 'gm', data });
@@ -127,12 +128,13 @@ function deliverChat(room, msg, readers) {
     for (const id of readers) { const p = member(room, id); if (p) send(p.ws, out); }
 }
 function member(room, id) { return room.players.get(id) || room.spec.get(id); }
-function publicMsg(m) { return { id: m.id, ch: m.ch, from: m.from, name: m.name, text: m.text, ts: m.ts, dm: m.dm, r: reactOut(m) }; }
+function publicMsg(m) { return { id: m.id, ch: m.ch, from: m.from, name: m.name, text: m.text, ts: m.ts, dm: m.dm, r: reactOut(m), cid: m.cid }; }
 function reactOut(m) { if (!m.react) return undefined; const o = {}; for (const [e, set] of Object.entries(m.react)) if (set.size) o[e] = [...set]; return Object.keys(o).length ? o : undefined; }
 function historyFor(room, pid) { return room.log.filter(m => pid === 'gm' || m.to.includes(pid)).map(publicMsg); }
-function cleanText(t) { return String(t || '').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').replace(/\s+\n/g, '\n').trim().slice(0, CHAT_MAX); }
+function cleanText(t, max) { return String(t || '').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').replace(/\s+\n/g, '\n').trim().slice(0, max || CHAT_MAX); }
 
 function handle(ws, m) {
+    ws._cid = undefined;   // mã tin chỉ áp cho đúng lệnh chat đang xử lý
     const room = ws.room ? rooms.get(ws.room) : null;
     switch (m.t) {
         // ---------------- QUẢN TRÒ ----------------
@@ -285,7 +287,8 @@ function handle(ws, m) {
         case 'chat': {
             if (!room) return;
             const ch = CHANNELS.includes(m.ch) ? m.ch : null; if (!ch) return err(ws, 'BAD_CH', 'Kênh không hợp lệ');
-            const text = cleanText(m.text); if (!text) return;
+            ws._cid = typeof m.cid === 'string' ? m.cid.slice(0, 24) : undefined;   // để máy gửi khớp tin hiện trước (cập nhật lạc quan)
+            const text = cleanText(m.text, ws.role === 'gm' ? 1500 : CHAT_MAX); if (!text) return;   // quản trò được dài hơn (danh sách người chết)
             const now = Date.now();
             ws.chatTimes = (ws.chatTimes || []).filter(t => now - t < CHAT_WINDOW);
             if (ws.chatTimes.length >= (ws.role === 'gm' ? 40 : CHAT_RATE)) return err(ws, 'CHAT_SLOW', 'Bạn nhắn nhanh quá, chờ vài giây'); // quản trò: 40 tin/10s (thông báo tự động dồn lúc trời sáng)
@@ -293,7 +296,10 @@ function handle(ws, m) {
             const id = 'm' + rnd(6);
             if (ws.role === 'gm' && room.gm === ws) {
                 if (ch === 'dm' && !room.players.has(m.to)) return err(ws, 'BAD_TO', 'Không tìm thấy người nhận');
-                deliverChat(room, { id, ch, from: 'gm', name: 'Quản trò', text, ts: now, dm: ch === 'dm' ? m.to : undefined }, readersOf(room, ch, m.to));
+                // Quản trò nhắn phòng Sói / Cặp Đôi ngoài lượt: gửi tới đúng danh sách quản trò chỉ định (người đã từng thức trong phòng đó)
+                let readers = readersOf(room, ch, m.to);
+                if ((ch === 'wolves' || ch === 'couple') && Array.isArray(m.readers)) readers = [...new Set([...readers, ...m.readers.filter(x => room.players.has(x))])];
+                deliverChat(room, { id, ch, from: 'gm', name: 'Quản trò', text, ts: now, dm: ch === 'dm' ? m.to : undefined, cid: ws._cid }, readers);
                 return;
             }
             if (ws.role !== 'player') return;
@@ -304,7 +310,7 @@ function handle(ws, m) {
                 if (wait > 0) return err(ws, 'CHAT_SLOW', `🐢 Chế độ chậm: chờ ${Math.ceil(wait / 1000)} giây nữa`);
                 p.lastPublic = now;
             }
-            deliverChat(room, { id, ch, from: p.id, name: p.name, text, ts: now, dm: ch === 'dm' ? p.id : undefined }, readersOf(room, ch, p.id));
+            deliverChat(room, { id, ch, from: p.id, name: p.name, text, ts: now, cid: ws._cid, dm: ch === 'dm' ? p.id : undefined }, readersOf(room, ch, p.id));
             touch(room); return;
         }
         case 'slow': {  // quản trò bật/tắt chế độ chậm cho kênh Làng
