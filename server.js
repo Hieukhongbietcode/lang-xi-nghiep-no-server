@@ -108,15 +108,19 @@ function permFor(room, pid) {
     const can = {}; CHANNELS.forEach(c => can[c] = room.perm[c].has(pid));
     if (!room.locked && room.players.has(pid)) can.public = true;   // sảnh chờ: chat tự do
     can.turn = room.perm.dm.has(pid);                                // đang tới lượt vai của mình
+    if (room.spec.has(pid)) { CHANNELS.forEach(c => can[c] = specCan(room, c)); can.turn = false; }
     if (room.dmAll !== false && room.players.has(pid)) can.dm = true; // nhắn riêng quản trò: luôn mở (trừ khi hết ván)
     return can;
 }
-const canWrite = (room, ch, pid) => room.perm[ch].has(pid) || (ch === 'public' && !room.locked && room.players.has(pid)) || (ch === 'dm' && room.dmAll !== false && room.players.has(pid));
+const specCan = (room, ch) => room.dmAll !== false ? ch === 'dead' : ch === 'public';   // khán giả: kênh Người chết trong ván, kênh Làng khi hết ván
+const canWrite = (room, ch, pid) => (room.spec.has(pid) && specCan(room, ch)) || room.perm[ch].has(pid) || (ch === 'public' && !room.locked && room.players.has(pid)) || (ch === 'dm' && room.dmAll !== false && room.players.has(pid));
+function sendPermAll(room) { for (const p of room.players.values()) sendPerm(room, p); for (const p of room.spec.values()) sendPerm(room, p); }
 function sendPerm(room, p) { send(p.ws, { t: 'chat_perm', can: permFor(room, p.id), label: room.label || '', slow: room.slow || 0 }); }
 // Ai được nhận tin ở kênh này (người chơi). Quản trò luôn nhận.
 function readersOf(room, ch, pid) {
     if (ch === 'public') return [...room.players.keys(), ...room.spec.keys()]; // cả làng (kể cả người chết) + khán giả đọc được kênh Làng
     if (ch === 'dm') return pid ? [pid] : [];                   // nhắn riêng: chỉ người đó + quản trò
+    if (ch === 'dead') return [...new Set([...room.perm.dead, ...room.spec.keys()])];   // khán giả đọc chung phòng Người chết
     if (ch === 'muted') return [...new Set([...room.perm.muted, ...room.perm.dead])]; // bị cấm nói: chỉ người bị cấm + người chết (+ quản trò)
     return [...room.perm[ch]];                                   // Sói / Cặp đôi / Người chết: chỉ thành viên kênh
 }
@@ -184,7 +188,7 @@ function handle(ws, m) {
         case 'close': {
             if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò mới làm được');
             touch(room);
-            if (m.t === 'lock') { room.locked = !!m.locked; if (!room.locked) room.final = false; sendGmState(room); broadcastRoster(room); for (const p of room.players.values()) sendPerm(room, p); return; }
+            if (m.t === 'lock') { room.locked = !!m.locked; if (!room.locked) room.final = false; sendGmState(room); broadcastRoster(room); sendPermAll(room); return; }
             if (m.t === 'kick') {
                 if (room.locked) return err(ws, 'LOCKED', 'Phòng đã khoá, không mời ra được');
                 const p = room.players.get(m.playerId); if (!p) return;
@@ -213,7 +217,7 @@ function handle(ws, m) {
                 const sp = { id: 's' + rnd(6), name, token: rnd(16), ws: null, spec: true };
                 r.spec.set(sp.id, sp); sp.ws = ws; ws.role = 'spec'; ws.room = r.code; ws.pid = sp.id; touch(r);
                 send(ws, { t: 'joined', code: r.code, playerId: sp.id, token: sp.token, name: sp.name, spec: true });
-                broadcastRoster(r); replayKept(r, sp); send(ws, { t: 'chat_hist', list: historyFor(r, sp.id) }); sendAvatars(r, ws); setAvatar(r, sp, m.avatar);
+                broadcastRoster(r); replayKept(r, sp); send(ws, { t: 'chat_hist', list: historyFor(r, sp.id) }); sendPerm(r, sp); sendAvatars(r, ws); setAvatar(r, sp, m.avatar);
                 return;
             }
             if (r.final) return err(ws, 'LOCKED_FINAL', 'Ván đã chia bài — không thể vào chơi nữa. Bạn có thể vào xem.');
@@ -239,7 +243,7 @@ function handle(ws, m) {
                 if (!sp) return err(ws, 'NOT_MEMBER', 'Bạn không còn trong phòng này');
                 sp.ws = ws; ws.role = 'spec'; ws.room = r.code; ws.pid = sp.id; touch(r);
                 send(ws, { t: 'joined', code: r.code, playerId: sp.id, token: sp.token, name: sp.name, spec: true, resumed: true });
-                broadcastRoster(r); replayKept(r, sp); send(ws, { t: 'chat_hist', list: historyFor(r, sp.id) }); sendAvatars(r, ws); setAvatar(r, sp, m.avatar);
+                broadcastRoster(r); replayKept(r, sp); send(ws, { t: 'chat_hist', list: historyFor(r, sp.id) }); sendPerm(r, sp); sendAvatars(r, ws); setAvatar(r, sp, m.avatar);
                 return;
             }
             attachPlayer(r, p, ws); // phòng đã khoá vẫn cho người CŨ vào lại
@@ -275,7 +279,15 @@ function handle(ws, m) {
             touch(room); return;
         }
         case 'to_gm': { // người chơi -> quản trò
-            if (!room || ws.role !== 'player' || !m.data || typeof m.data !== 'object') return;
+            if (!room || (ws.role !== 'player' && ws.role !== 'spec') || !m.data || typeof m.data !== 'object') return;
+            if (m.data.kind === 'bug') {   // hộp đen: ghi vào nhật ký server (Render -> Logs) + báo quản trò
+                const now = Date.now(); ws.bugTimes = (ws.bugTimes || []).filter(t => now - t < 60000); if (ws.bugTimes.length >= 6) return; ws.bugTimes.push(now);
+                const who = (room.players.get(ws.pid) || room.spec.get(ws.pid) || {}).name || '?';
+                const d = m.data, line = { room: room.code, who, msg: String(d.msg || '').slice(0, 300), at: String(d.at || '').slice(0, 60), stack: String(d.stack || '').slice(0, 600), ua: String(d.ua || '').slice(0, 160), v: String(d.v || '').slice(0, 20) };
+                console.log('[LOI-NGUOI-CHOI] ' + JSON.stringify(line));
+                send(room.gm, { t: 'msg', from: ws.pid, data: Object.assign({ kind: 'bug' }, line) }); return;
+            }
+            if (ws.role !== 'player') return;
             send(room.gm, { t: 'msg', from: ws.pid, data: m.data }); touch(room);
             return;
         }
@@ -285,7 +297,7 @@ function handle(ws, m) {
             CHANNELS.forEach(c => (Array.isArray(m.perm && m.perm[c]) ? m.perm[c] : []).forEach(id => { if (room.players.has(id)) np[c].add(id); }));
             room.perm = np; room.label = String(m.label || '').slice(0, 80);
             if (typeof m.dmAll === 'boolean') room.dmAll = m.dmAll;   // false khi hết ván: chỉ còn kênh Làng
-            for (const p of room.players.values()) sendPerm(room, p);
+            sendPermAll(room);
             return;
         }
         case 'chat': {
@@ -308,29 +320,29 @@ function handle(ws, m) {
                 deliverChat(room, { id, ch, from: 'gm', name: 'Quản trò', text, ts: now, dm: ch === 'dm' ? m.to : undefined, cid: ws._cid, audio, dur }, readers);
                 return;
             }
-            if (ws.role !== 'player') return;
-            const p = room.players.get(ws.pid); if (!p) return;
+            if (ws.role !== 'player' && ws.role !== 'spec') return;
+            const p = room.players.get(ws.pid) || room.spec.get(ws.pid); if (!p) return;
             if (!canWrite(room, ch, p.id)) return err(ws, 'CHAT_LOCKED', 'Chưa tới lượt bạn chat ở kênh này');
             if (ch === 'public' && room.slow) {
                 const wait = (p.lastPublic || 0) + room.slow * 1000 - now;
                 if (wait > 0) return err(ws, 'CHAT_SLOW', `🐢 Chế độ chậm: chờ ${Math.ceil(wait / 1000)} giây nữa`);
                 p.lastPublic = now;
             }
-            deliverChat(room, { id, ch, from: p.id, name: p.name, text, ts: now, cid: ws._cid, dm: ch === 'dm' ? p.id : undefined, audio, dur }, readersOf(room, ch, p.id));
+            deliverChat(room, { id, ch, from: p.id, name: ws.role === 'spec' ? p.name + ' (khán giả)' : p.name, text, ts: now, cid: ws._cid, dm: ch === 'dm' ? p.id : undefined, audio, dur }, readersOf(room, ch, p.id));
             touch(room); return;
         }
         case 'slow': {  // quản trò bật/tắt chế độ chậm cho kênh Làng
             if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò');
             room.slow = Math.max(0, Math.min(60, parseInt(m.sec, 10) || 0));
-            for (const p of room.players.values()) sendPerm(room, p);
+            sendPermAll(room);
             send(ws, { t: 'slow_ok', sec: room.slow });
             return;
         }
         case 'typing': { // "đang gõ…" — chỉ ở kênh riêng, chỉ người có quyền viết kênh đó
-            if (!room || ws.role !== 'player') return;
+            if (!room || (ws.role !== 'player' && ws.role !== 'spec')) return;
             const ch = m.ch; if (!['dm', 'wolves', 'couple', 'dead', 'muted'].includes(ch) || !canWrite(room, ch, ws.pid)) return;
             const now = Date.now(); if (now - (ws.lastTyping || 0) < 1500) return; ws.lastTyping = now;
-            const p = room.players.get(ws.pid); if (!p) return;
+            const p = room.players.get(ws.pid) || room.spec.get(ws.pid); if (!p) return;
             const out = { t: 'typing', ch, from: p.id, name: p.name };
             send(room.gm, out);
             if (ch !== 'dm') for (const id of readersOf(room, ch, p.id)) { if (id !== p.id) { const q = room.players.get(id); if (q) send(q.ws, out); } }
