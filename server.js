@@ -443,3 +443,74 @@ setInterval(() => {
 }, 60000);
 
 server.listen(PORT, () => console.log(`Server chạy ở cổng ${PORT}`));
+
+// =====================================================================
+//  LƯU PHÒNG RA UPSTASH REDIS — phòng sống sót khi server khởi động lại
+//  Chỉ chạy khi Render có 2 biến môi trường UPSTASH_REDIS_REST_URL và UPSTASH_REDIS_REST_TOKEN.
+//  Không có thì server chạy như cũ (chỉ giữ trong bộ nhớ).
+// =====================================================================
+const UP_URL = String(process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, ''), UP_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || '');
+const PERSIST = !!(UP_URL && UP_TOKEN && typeof fetch === 'function'), PERSIST_TTL = 12 * 3600;
+let _upErrAt = 0;
+async function up(cmds) {
+    const r = await fetch(UP_URL + '/pipeline', { method: 'POST', headers: { Authorization: 'Bearer ' + UP_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(cmds) });
+    if (!r.ok) throw new Error('Upstash HTTP ' + r.status);
+    return r.json();
+}
+function upErr(e) { if (Date.now() - _upErrAt > 60000) { _upErrAt = Date.now(); console.log('[LUU-PHONG] loi: ' + (e && e.message || e)); } }
+function roomDump(r) {
+    return {
+        code: r.code, gmToken: r.gmToken, locked: r.locked, final: !!r.final, dmAll: r.dmAll, label: r.label || '', slow: r.slow || 0,
+        perm: Object.fromEntries(Object.entries(r.perm).map(([k, v]) => [k, [...v]])),
+        players: [...r.players.values()].map(p => ({ id: p.id, name: p.name, token: p.token, kept: p.kept || {} })),
+        spec: [...r.spec.values()].map(p => ({ id: p.id, name: p.name, token: p.token })),
+        keptAll: r.keptAll || {},
+        // tin thoại không lưu âm thanh (tiết kiệm băng thông)
+        log: r.log.map(m => Object.assign({}, m, m.audio ? { audio: undefined, gone: true, text: '🎤 Tin nhắn thoại (đã hết hạn)' } : {},
+            m.react ? { react: Object.fromEntries(Object.entries(m.react).map(([e, s]) => [e, [...s]])) } : {})),
+        createdAt: r.createdAt, lastActive: r.lastActive
+    };
+}
+function roomLoad(d) {
+    const perm = emptyPerm(); Object.entries(d.perm || {}).forEach(([k, ids]) => { if (perm[k]) ids.forEach(id => perm[k].add(id)); });
+    const now = Date.now();
+    return {
+        code: d.code, gmToken: d.gmToken, gm: null, locked: !!d.locked, final: !!d.final, dmAll: d.dmAll, label: d.label || '', slow: d.slow || 0,
+        players: new Map((d.players || []).map(p => [p.id, { id: p.id, name: p.name, token: p.token, ws: null, kept: p.kept || {}, offSince: now }])),
+        spec: new Map((d.spec || []).map(p => [p.id, { id: p.id, name: p.name, token: p.token, ws: null, spec: true }])),
+        knocks: new Map(), keptAll: d.keptAll || {}, perm,
+        log: (d.log || []).map(m => Object.assign({}, m, m.react ? { react: Object.fromEntries(Object.entries(m.react).map(([e, a]) => [e, new Set(a)])) } : {})),
+        createdAt: d.createdAt || now, lastActive: now
+    };
+}
+if (PERSIST) {
+    const saved = new Map(), savedSnap = new Map();
+    console.log('[LUU-PHONG] BAT — phong duoc luu vao Upstash moi 5 giay');
+    // khởi động: nạp lại các phòng đã lưu
+    (async () => {
+        try {
+            const [[, keys]] = await up([['KEYS', 'lxn:room:*']]).then(r => r.map(x => [null, x.result]));
+            if (keys && keys.length) {
+                const res = await up([['MGET', ...keys], ['MGET', ...keys.map(k => k.replace('lxn:room:', 'lxn:snap:'))]]);
+                const rs = res[0].result || [], ss = res[1].result || []; let n = 0;
+                rs.forEach((raw, i) => { if (!raw) return; try { const d = JSON.parse(raw); if (rooms.has(d.code)) return; const r = roomLoad(d);
+                    if (ss[i]) { try { r.snap = JSON.parse(ss[i]); savedSnap.set(r.code, r.snap.at); } catch (e) {} }
+                    rooms.set(r.code, r); saved.set(r.code, raw); n++; } catch (e) {} });
+                console.log(`[LUU-PHONG] da nap lai ${n} phong sau khi server khoi dong`);
+            } else console.log('[LUU-PHONG] khong co phong nao can nap lai');
+        } catch (e) { upErr(e); }
+    })();
+    // mỗi 5 giây: lưu phòng có thay đổi
+    setInterval(async () => {
+        const cmds = [];
+        for (const [code, r] of rooms) {
+            let raw; try { raw = JSON.stringify(roomDump(r)); } catch (e) { continue; }
+            if (saved.get(code) !== raw) { cmds.push(['SET', 'lxn:room:' + code, raw, 'EX', String(PERSIST_TTL)]); saved.set(code, raw); }
+            if (r.snap && savedSnap.get(code) !== r.snap.at) { cmds.push(['SET', 'lxn:snap:' + code, JSON.stringify(r.snap), 'EX', String(PERSIST_TTL)]); savedSnap.set(code, r.snap.at); }
+        }
+        if (cmds.length) up(cmds).catch(e => { upErr(e); saved.clear(); savedSnap.clear(); });   // lỗi -> lần sau lưu lại toàn bộ
+    }, 5000);
+    // phòng bị đóng / hết hạn -> xoá khỏi Upstash
+    const _del = rooms.delete.bind(rooms);
+    rooms.delete = code => { up([['DEL', 'lxn:room:' + code], ['DEL', 'lxn:snap:' + code]]).catch(upErr); saved.delete(code); savedSnap.delete(code); return _del(code); };
+} else console.log('[LUU-PHONG] tat — chua co UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (phong chi giu trong bo nho)');
