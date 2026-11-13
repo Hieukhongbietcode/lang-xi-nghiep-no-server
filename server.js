@@ -302,7 +302,7 @@ function handle(ws, m) {
         }
         case 'chat': {
             if (!room) return;
-            const ch = CHANNELS.includes(m.ch) ? m.ch : null; if (!ch) return err(ws, 'BAD_CH', 'Kênh không hợp lệ');
+            const ch = CHANNELS.includes(m.ch) ? m.ch : (m.ch === 'gmnote' && ws.role === 'gm' && room.gm === ws ? 'gmnote' : null); if (!ch) return err(ws, 'BAD_CH', 'Kênh không hợp lệ');   // gmnote: ghi chú chỉ quản trò đọc (kết quả bỏ phiếu), lưu cùng lịch sử phòng
             ws._cid = typeof m.cid === 'string' ? m.cid.slice(0, 24) : undefined;   // để máy gửi khớp tin hiện trước (cập nhật lạc quan)
             const audio = okAudio(m.audio) ? m.audio : undefined, dur = audio ? Math.max(1, Math.min(30, Math.round(+m.dur || 1))) : undefined;
             if (m.audio && !audio) return err(ws, 'CHAT_AUDIO', 'Tin nhắn thoại không hợp lệ hoặc quá dài (tối đa 30 giây)');
@@ -315,7 +315,7 @@ function handle(ws, m) {
             if (ws.role === 'gm' && room.gm === ws) {
                 if (ch === 'dm' && !room.players.has(m.to)) return err(ws, 'BAD_TO', 'Không tìm thấy người nhận');
                 // Quản trò nhắn phòng Sói / Cặp Đôi ngoài lượt: gửi tới đúng danh sách quản trò chỉ định (người đã từng thức trong phòng đó)
-                let readers = readersOf(room, ch, m.to);
+                let readers = ch === 'gmnote' ? [] : readersOf(room, ch, m.to);
                 if ((ch === 'wolves' || ch === 'couple') && Array.isArray(m.readers)) readers = [...new Set([...readers, ...m.readers.filter(x => room.players.has(x))])];
                 deliverChat(room, { id, ch, from: 'gm', name: 'Quản trò', text, ts: now, dm: ch === 'dm' ? m.to : undefined, cid: ws._cid, audio, dur }, readers);
                 return;
