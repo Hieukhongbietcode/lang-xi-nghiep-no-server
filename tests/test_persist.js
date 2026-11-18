@@ -1,0 +1,36 @@
+const WebSocket = require('ws'); const { spawn } = require('child_process');
+const open = () => new Promise(r => { const w = new WebSocket('ws://localhost:8787'); w.inbox = []; w.on('message', d => w.inbox.push(JSON.parse(d))); w.on('open', () => r(w)); });
+const wait = ms => new Promise(r => setTimeout(r, ms)); const last = (w, t) => [...w.inbox].reverse().find(m => m.t === t);
+const S = async (w, o) => { w.send(JSON.stringify(o)); await wait(150); }; const ok = (c, m) => console.log((c ? '  ✅ ' : '  ❌ ') + m);
+let log = '';
+const startSrv = (env) => { const p = spawn('node', [require('path').join(__dirname, '..', 'server.js')], { env: Object.assign({}, process.env, { PORT: '8787' }, env) }); p.stdout.on('data', d => log += d); p.stderr.on('data', d => log += d); return p; };
+const ENV = { UPSTASH_REDIS_REST_URL: 'http://localhost:8790', UPSTASH_REDIS_REST_TOKEN: 'test-token' };
+const stats = () => fetch('http://localhost:8790/stats', { method: 'POST', headers: { authorization: 'Bearer test-token' } }).then(r => r.json());
+(async () => {
+  let srv = startSrv(ENV); await wait(1200);
+  ok(/\[LUU-PHONG\] BAT/.test(log), 'server bat che do luu phong (thay bien moi truong Upstash)');
+  const gm = await open(); await S(gm, { t: 'create' }); const { code, gmToken } = last(gm, 'created');
+  const a = await open(); await S(a, { t: 'join', code, name: 'An' }); const b = await open(); await S(b, { t: 'join', code, name: 'Bình' });
+  const A = last(a, 'joined'); await S(gm, { t: 'lock', locked: true });
+  await S(gm, { t: 'to', to: A.playerId, keep: 'card', data: { kind: 'card', role: { name: 'Tiên Tri' } } });
+  await S(gm, { t: 'perm', perm: { public: [A.playerId, last(b, 'joined').playerId] } });
+  await S(a, { t: 'chat', ch: 'public', text: 'ai là sói?' }); await S(b, { t: 'chat', ch: 'public', text: 'không phải tôi' });
+  await S(gm, { t: 'snap_put', data: 'BAN-SAO-MA-HOA', iv: 'iv1', z: true, label: 'Đêm 1', force: true });
+  await wait(5600);
+  const st = await stats(); ok(st.keys.includes('lxn:room:' + code) && st.keys.includes('lxn:snap:' + code), 'sau 5 giay: phong + ban sao van da luu len Upstash');
+  // server khởi động lại
+  srv.kill(); await wait(600); log = ''; srv = startSrv(ENV); await wait(1800);
+  ok(/da nap lai 1 phong/.test(log), 'server khoi dong lai -> "' + (log.match(/\[LUU-PHONG\] da nap[^\n]*/) || ['-'])[0] + '"');
+  const gm2 = await open(); await S(gm2, { t: 'gm_resume', code, gmToken });
+  ok(!!last(gm2, 'gm_ok') && last(gm2, 'gm_state').players.length === 2, 'quan tro vao lai dung phong, du 2 nguoi choi');
+  const a2 = await open(); await S(a2, { t: 'resume', code, token: A.token });
+  ok(last(a2, 'joined')?.resumed, 'nguoi choi An vao lai bang ma cu tren may');
+  ok(a2.inbox.some(m => m.t === 'msg' && m.data && m.data.kind === 'card' && m.data.role.name === 'Tiên Tri'), 'An nhan lai dung la bai (Tien Tri)');
+  ok((last(a2, 'chat_hist') || { list: [] }).list.map(m => m.text).join('|') === 'ai là sói?|không phải tôi', 'lich su chat con nguyen');
+  await S(gm2, { t: 'snap_get' }); ok(last(gm2, 'snap')?.data === 'BAN-SAO-MA-HOA', 'ban sao van (chuyen quyen) van con');
+  await S(gm2, { t: 'close' }); await wait(800);
+  ok(!(await stats()).keys.some(k => k.includes(code)), 'dong phong -> xoa khoi Upstash');
+  srv.kill(); await wait(500); log = ''; srv = startSrv({}); await wait(1000);
+  ok(/\[LUU-PHONG\] tat/.test(log), 'khong co bien moi truong -> server chay nhu cu (chi bo nho)');
+  srv.kill(); process.exit(0);
+})();

@@ -1,0 +1,25 @@
+const WebSocket = require('ws');
+const open = () => new Promise(r => { const w = new WebSocket('ws://localhost:8787'); w.inbox = []; w.on('message', d => w.inbox.push(JSON.parse(d))); w.on('open', () => r(w)); });
+const wait = ms => new Promise(r => setTimeout(r, ms)); const last = (w, t) => [...w.inbox].reverse().find(m => m.t === t);
+const S = async (w, o) => { w.send(JSON.stringify(o)); await wait(120); }; const ok = (c, m) => console.log((c ? '  ✅ ' : '  ❌ ') + m);
+(async () => {
+  const gm = await open(); await S(gm, { t: 'create' }); const { code } = last(gm, 'created');
+  const a = await open(); await S(a, { t: 'join', code, name: 'An' }); const A = last(a, 'joined');
+  const b = await open(); await S(b, { t: 'join', code, name: 'Bình' }); const B = last(b, 'joined');
+  await S(gm, { t: 'to', to: A.playerId, keep: 'card', data: { kind: 'card', dealId: 'd1', role: { name: 'Tiên Tri' } } });
+  ok(a.inbox.some(m => m.t === 'msg' && m.data.role?.name === 'Tiên Tri'), 'An nhan duoc la cua An');
+  ok(!b.inbox.some(m => JSON.stringify(m).includes('Tiên Tri')), 'Binh KHONG nhan duoc gi ve la cua An');
+  await S(b, { t: 'to', to: A.playerId, data: { kind: 'card', role: { name: 'Gia mao' } } });
+  ok(last(b, 'error')?.code === 'NOT_GM' && !a.inbox.some(m => JSON.stringify(m).includes('Gia mao')), 'Binh gia lam quan tro gui bai cho An -> bi chan');
+  await S(a, { t: 'to_gm', data: { kind: 'viewed', dealId: 'd1' } });
+  ok(last(gm, 'msg')?.from === A.playerId && last(gm, 'msg').data.kind === 'viewed', 'An bao "da xem" -> quan tro nhan, biet la An');
+  ok(!b.inbox.some(m => m.t === 'msg' && m.data.kind === 'viewed'), 'Binh khong thay tin "da xem" cua An');
+  a.close(); await wait(150);
+  const a2 = await open(); await S(a2, { t: 'resume', code, token: A.token });
+  ok(a2.inbox.some(m => m.t === 'msg' && m.data.role?.name === 'Tiên Tri'), 'An tai lai trang -> tu nhan lai dung la cua minh');
+  await S(gm, { t: 'all', keep: 'phase', data: { kind: 'started' } });
+  ok(a2.inbox.some(m => m.data?.kind === 'started') && b.inbox.some(m => m.data?.kind === 'started'), 'tin cong khai "van da bat dau" toi ca 2');
+  const b2 = await open(); b.close(); await wait(100); await S(b2, { t: 'resume', code, token: B.token });
+  ok(b2.inbox.some(m => m.data?.kind === 'started') && !b2.inbox.some(m => JSON.stringify(m).includes('Tiên Tri')), 'Binh vao lai: nhan lai tin cong khai, van KHONG thay la cua An');
+  process.exit(0);
+})();

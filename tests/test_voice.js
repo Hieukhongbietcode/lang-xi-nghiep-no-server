@@ -1,0 +1,21 @@
+const WebSocket = require('ws');
+const open = () => new Promise(r => { const w = new WebSocket('ws://localhost:8787'); w.inbox = []; w.on('message', d => w.inbox.push(JSON.parse(d))); w.on('open', () => r(w)); });
+const wait = ms => new Promise(r => setTimeout(r, ms)); const last = (w, t) => [...w.inbox].reverse().find(m => m.t === t);
+const S = async (w, o) => { w.send(JSON.stringify(o)); await wait(150); }; const ok = (c, m) => console.log((c ? '  ✅ ' : '  ❌ ') + m);
+const fake = n => 'data:audio/webm;codecs=opus;base64,' + Buffer.alloc(n).toString('base64');
+(async () => {
+  const gm = await open(); await S(gm, { t: 'create' }); const { code } = last(gm, 'created');
+  const a = await open(); await S(a, { t: 'join', code, name: 'An' }); const b = await open(); await S(b, { t: 'join', code, name: 'Bình' });
+  await S(a, { t: 'chat', ch: 'public', text: '', audio: fake(60000), dur: 8, cid: 'v1' });
+  const got = b.inbox.find(m => m.t === 'chat' && m.m.audio);
+  ok(got && got.m.dur === 8 && got.m.cid === 'v1', 'tin thoai 8s (~80 KB) toi Binh + quan tro: ' + (got ? got.m.text : '-'));
+  ok(gm.inbox.some(m => m.t === 'chat' && m.m.audio), 'quan tro nhan duoc tin thoai');
+  await S(a, { t: 'chat', ch: 'public', audio: 'data:text/html;base64,PHNjcmlwdD4=', cid: 'v2' });
+  ok(last(a, 'error')?.code === 'CHAT_AUDIO', 'du lieu khong phai am thanh -> bi tu choi');
+  await S(gm, { t: 'lock', locked: true });
+  await S(a, { t: 'chat', ch: 'public', audio: fake(1000), dur: 1, cid: 'v3' });
+  ok(last(a, 'error')?.code === 'CHAT_LOCKED' && last(a, 'error').cid === 'v3', 'kenh dang khoa -> tin thoai cung bi chan (theo luat kenh)');
+  const c = await open(); await S(c, { t: 'join', code: code, name: 'Cường', spectate: true });
+  ok(c.inbox.some(m => m.t === 'chat_hist' && m.list.some(x => x.audio)), 'nguoi vao sau van nghe lai duoc tin thoai trong lich su');
+  process.exit(0);
+})();

@@ -1,0 +1,28 @@
+const WebSocket = require('ws'); const fs = require('fs');
+const open = () => new Promise(r => { const w = new WebSocket('ws://localhost:8787'); w.inbox = []; w.on('message', d => w.inbox.push(JSON.parse(d))); w.on('open', () => r(w)); });
+const wait = ms => new Promise(r => setTimeout(r, ms)); const last = (w, t) => [...w.inbox].reverse().find(m => m.t === t);
+const S = async (w, o) => { w.send(JSON.stringify(o)); await wait(150); }; const ok = (c, m) => console.log((c ? '  ✅ ' : '  ❌ ') + m);
+const saw = (w, t) => w.inbox.some(m => m.t === 'chat' && m.m.text === t);
+(async () => {
+  const gm = await open(); await S(gm, { t: 'create' }); const { code } = last(gm, 'created');
+  const a = await open(); await S(a, { t: 'join', code, name: 'An' }); const b = await open(); await S(b, { t: 'join', code, name: 'Bình' });
+  await S(gm, { t: 'lock', locked: true }); await S(gm, { t: 'final', on: true });
+  const k = await open(); await S(k, { t: 'join', code, name: 'Khoa', spectate: true });
+  const aid = last(a, 'joined').playerId;
+  await S(gm, { t: 'perm', perm: { dead: [aid] }, dmAll: true });
+  ok(last(k, 'chat_perm')?.can.dead === true && !last(k, 'chat_perm').can.public, '10. khan gia: chat duoc phong Nguoi chet, KHONG duoc kenh Lang');
+  await S(k, { t: 'chat', ch: 'dead', text: 'ai là sói vậy' });
+  const got = a.inbox.find(m => m.t === 'chat' && m.m.text === 'ai là sói vậy');
+  ok(got && got.m.name === 'Khoa (khán giả)' && saw(gm, 'ai là sói vậy') && !saw(b, 'ai là sói vậy'), '10. nguoi chet + quan tro thay "' + (got ? got.m.name : '-') + ': ai la soi vay", nguoi song KHONG thay');
+  await S(a, { t: 'chat', ch: 'dead', text: 'tôi bị cắn oan' }); ok(saw(k, 'tôi bị cắn oan'), '10. khan gia doc duoc tin cua nguoi chet');
+  await S(k, { t: 'chat', ch: 'public', text: 'xin chào làng' }); ok(!saw(b, 'xin chào làng'), '10. khan gia KHONG noi duoc o kenh Lang trong van');
+  await S(gm, { t: 'perm', perm: { public: [aid, last(b, 'joined').playerId] }, dmAll: false });
+  await S(k, { t: 'chat', ch: 'public', text: 'gg' }); ok(saw(b, 'gg'), '10. het van: khan gia chat chung kenh Lang');
+  await S(a, { t: 'to_gm', data: { kind: 'bug', msg: 'TypeError: x is undefined', stack: 'at renderRing (play.html:1:2)', at: 'started/public/night', ua: 'iPhone', v: 't1' } });
+  await wait(300);
+  ok(last(gm, 'msg')?.data.kind === 'bug' && last(gm, 'msg').data.who === 'An', '3. quan tro nhan bao loi tu may An');
+  ok(fs.readFileSync((process.env.LXN_SRV_LOG || '/tmp/srv.log'), 'utf8').includes('[LOI-NGUOI-CHOI]') && fs.readFileSync((process.env.LXN_SRV_LOG || '/tmp/srv.log'), 'utf8').includes('x is undefined'), '3. nhat ky server ghi: [LOI-NGUOI-CHOI] ... x is undefined');
+  for (let i = 0; i < 10; i++) a.send(JSON.stringify({ t: 'to_gm', data: { kind: 'bug', msg: 'spam ' + i } })); await wait(400);
+  ok(gm.inbox.filter(m => m.t === 'msg' && m.data.kind === 'bug').length <= 6, '3. chong spam: toi da 6 bao loi / phut / may');
+  process.exit(0);
+})();
