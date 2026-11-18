@@ -15,6 +15,21 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
+// 1. Phiên bản server — app quản trò so sánh để báo khi quên upload server.js mới
+const SERVER_VERSION = '2026-11-18.1';
+// 5. Chỉ nhận kết nối từ trang của mình (+ máy cục bộ, file mở trên máy, công cụ không phải trình duyệt)
+const ALLOWED_ORIGINS = ['https://hieukhongbietcode.github.io'].concat(String(process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+function originOk(o) {
+    if (!o || o === 'null') return true;                                   // không phải trình duyệt / file:// trên máy
+    o = String(o).toLowerCase().replace(/\/+$/, '');
+    if (ALLOWED_ORIGINS.includes(o)) return true;
+    return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(o);   // thử trên máy
+}
+// 6. Giới hạn theo địa chỉ mạng (rộng tay: cả văn phòng thường chung 1 địa chỉ)
+const RL = { badCode: new Map(), creates: new Map() }, BAD_MAX = 30, BAD_WIN = 10 * 60000, BLOCK_MS = 10 * 60000, CREATE_MAX = 10, CREATE_WIN = 60 * 60000, ROOMS_MAX = 300;
+function rlHits(map, ip, win) { const now = Date.now(), L = (map.get(ip) || []).filter(t => now - t < win); map.set(ip, L); return L; }
+function ipBlocked(ip) { const L = rlHits(RL.badCode, ip, BAD_WIN + BLOCK_MS); return L.length >= BAD_MAX && Date.now() - L[L.length - 1] < BLOCK_MS; }
+let upState = { ok: null, at: 0, err: '' };   // trạng thái lần ghi Upstash gần nhất (cho /health)
 const MAX_PLAYERS = 60;
 const MAX_NAME = 20;
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // bỏ chữ dễ nhầm: I, L, O, 0, 1
@@ -79,6 +94,7 @@ function attachPlayer(room, p, ws) {
     touch(room);
 }
 function err(ws, code, msg) {
+    if (code === 'NO_ROOM' && ws && ws._ip && ['join', 'spectate', 'knock'].includes(ws._lastT)) RL.badCode.set(ws._ip, rlHits(RL.badCode, ws._ip, BAD_WIN + BLOCK_MS).concat(Date.now()));
     if (/^CHAT_/.test(code) && ws && ws._cid) { send(ws, { t: 'error', code, msg, cid: ws._cid }); return; } send(ws, { t: 'error', code, msg }); }
 // Gửi lại các tin quản trò đã "giữ" (lá bài, trạng thái ván) cho người vừa vào lại
 function replayKept(room, p) {
@@ -142,7 +158,12 @@ function historyFor(room, pid) { const spec = room.spec && room.spec.has(pid); r
 function cleanText(t, max) { return String(t || '').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').replace(/\s+\n/g, '\n').trim().slice(0, max || CHAT_MAX); }
 
 function handle(ws, m) {
-    ws._cid = undefined;   // mã tin chỉ áp cho đúng lệnh chat đang xử lý
+    ws._cid = undefined; ws._lastT = m.t;
+    if (['join', 'spectate', 'knock'].includes(m.t) && ws._ip && ipBlocked(ws._ip)) return err(ws, 'RATE_LIMIT', 'Nhập sai mã phòng quá nhiều lần — đợi vài phút rồi thử lại');
+    if (m.t === 'create') {
+        if (rooms.size >= ROOMS_MAX) return err(ws, 'SERVER_FULL', 'Server đang quá tải — thử lại sau');
+        if (ws._ip) { const L = rlHits(RL.creates, ws._ip, CREATE_WIN); if (L.length >= CREATE_MAX) return err(ws, 'RATE_LIMIT', 'Tạo quá nhiều phòng — đợi một lúc rồi thử lại'); RL.creates.set(ws._ip, L.concat(Date.now())); }
+    }   // mã tin chỉ áp cho đúng lệnh chat đang xử lý
     const room = ws.room ? rooms.get(ws.room) : null;
     switch (m.t) {
         // ---------------- QUẢN TRÒ ----------------
@@ -266,7 +287,7 @@ function handle(ws, m) {
         // ---------------- TIN RIÊNG (Giai đoạn 2) ----------------
         case 'to': {   // quản trò -> 1 người chơi
             if (!room || ws.role !== 'gm' || room.gm !== ws) return err(ws, 'NOT_GM', 'Chỉ quản trò mới gửi được');
-            const p = room.players.get(m.to); if (!p || !m.data || typeof m.data !== 'object') return;
+            const p = room.players.get(m.to) || (m.data && m.data.kind === 'reveal' ? room.spec.get(m.to) : null); if (!p || !m.data || typeof m.data !== 'object') return;   // khán giả: chỉ nhận 'vai & nhật ký' (khi quản trò bật)
             if (typeof m.keep === 'string' && KEEP_RE.test(m.keep)) { p.kept = p.kept || {}; p.kept[m.keep] = m.data; }
             send(p.ws, { t: 'msg', from: 'gm', data: m.data }); touch(room);
             return;
@@ -287,7 +308,7 @@ function handle(ws, m) {
                 console.log('[LOI-NGUOI-CHOI] ' + JSON.stringify(line));
                 send(room.gm, { t: 'msg', from: ws.pid, data: Object.assign({ kind: 'bug' }, line) }); return;
             }
-            if (ws.role !== 'player') return;
+            if (ws.role !== 'player' && !(ws.role === 'spec' && m.data.kind === 'predict')) return;   // khán giả chỉ được gửi 'đoán phe thắng'
             send(room.gm, { t: 'msg', from: ws.pid, data: m.data }); touch(room);
             return;
         }
@@ -397,13 +418,23 @@ function handle(ws, m) {
 
 // ---------------- HTTP (để Render kiểm tra sức khoẻ + đánh thức server) ----------------
 const server = http.createServer((req, res) => {
+    if ((req.url || '').startsWith('/health')) {   // 4. trang kiểm tra sức khoẻ (Render: Health Check Path = /health)
+        let players = 0, online = 0; for (const r of rooms.values()) for (const p of r.players.values()) { players++; if (p.ws && p.ws.readyState === 1) online++; }
+        const body = { ok: true, version: SERVER_VERSION, uptime_s: Math.round(process.uptime()), rooms: rooms.size, players, players_online: online, connections: wss.clients.size,
+            memory_mb: Math.round(process.memoryUsage().rss / 1048576), persist: typeof PERSIST !== 'undefined' ? PERSIST : false, upstash: upState };
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify(body));
+    }
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
     res.end(`Lang Xi Nghiep No server OK — ${rooms.size} phòng\n`);
 });
-const wss = new WebSocketServer({ server, maxPayload: 1536 * 1024 }); // quản trò cần gửi bản sao ván; người chơi bị giới hạn riêng 64 KB bên dưới
+const wss = new WebSocketServer({ server, maxPayload: 1536 * 1024,
+    verifyClient: (info) => { const ok = originOk(info.origin); if (!ok) console.log('[CHAN-NGUON] tu choi ket noi tu ' + info.origin); return ok; } }); // quản trò cần gửi bản sao ván; người chơi bị giới hạn riêng 64 KB bên dưới
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
     ws.isAlive = true;
+    ws._ip = String((req && req.headers['x-forwarded-for']) || (req && req.socket && req.socket.remoteAddress) || '').split(',')[0].trim();
+    send(ws, { t: 'hello', v: SERVER_VERSION });
     ws.on('pong', () => { ws.isAlive = true; if (ws.pingAt) ws.rtt = Date.now() - ws.pingAt; });
     ws.on('message', (data) => {
         if (data.length > (ws.role === 'gm' ? Infinity : data.length <= 320 * 1024 && /"t"\s*:\s*"chat"/.test(String(data).slice(0, 40)) ? 320 * 1024 : 64 * 1024)) { try { ws.close(1009, 'too big'); } catch (e) {} return; }
@@ -431,7 +462,7 @@ setInterval(() => {
     // báo quản trò chất lượng mạng của từng người chơi
     setTimeout(() => { for (const r of rooms.values()) if (r.gm && r.gm.readyState === 1)
         send(r.gm, { t: 'net', list: [...r.players.values()].map(p => ({ id: p.id, rtt: p.ws && p.ws.readyState === 1 ? (p.ws.rtt || 0) : -1, off: p.offSince || 0 })) }); }, 3000);
-}, 15000);
+}, +process.env.PING_MS || 15000);
 // Dọn phòng bỏ hoang
 setInterval(() => {
     const now = Date.now();
@@ -454,7 +485,8 @@ const PERSIST = !!(UP_URL && UP_TOKEN && typeof fetch === 'function'), PERSIST_T
 let _upErrAt = 0;
 async function up(cmds) {
     const r = await fetch(UP_URL + '/pipeline', { method: 'POST', headers: { Authorization: 'Bearer ' + UP_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(cmds) });
-    if (!r.ok) throw new Error('Upstash HTTP ' + r.status);
+    if (!r.ok) { upState = { ok: false, at: Date.now(), err: 'HTTP ' + r.status }; throw new Error('Upstash HTTP ' + r.status); }
+    upState = { ok: true, at: Date.now(), err: '' };
     return r.json();
 }
 function upErr(e) { if (Date.now() - _upErrAt > 60000) { _upErrAt = Date.now(); console.log('[LUU-PHONG] loi: ' + (e && e.message || e)); } }
@@ -510,7 +542,28 @@ if (PERSIST) {
         }
         if (cmds.length) up(cmds).catch(e => { upErr(e); saved.clear(); savedSnap.clear(); });   // lỗi -> lần sau lưu lại toàn bộ
     }, 5000);
+    // 2. lưu TOÀN BỘ phòng ngay (dùng khi server sắp tắt)
+    global.__flushRooms = async () => {
+        const cmds = [];
+        for (const [code, r] of rooms) { try { cmds.push(['SET', 'lxn:room:' + code, JSON.stringify(roomDump(r)), 'EX', String(PERSIST_TTL)]); if (r.snap) cmds.push(['SET', 'lxn:snap:' + code, JSON.stringify(r.snap), 'EX', String(PERSIST_TTL)]); } catch (e) {} }
+        if (cmds.length) await up(cmds);
+        return cmds.length;
+    };
     // phòng bị đóng / hết hạn -> xoá khỏi Upstash
     const _del = rooms.delete.bind(rooms);
     rooms.delete = code => { up([['DEL', 'lxn:room:' + code], ['DEL', 'lxn:snap:' + code]]).catch(upErr); saved.delete(code); savedSnap.delete(code); return _del(code); };
 } else console.log('[LUU-PHONG] tat — chua co UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (phong chi giu trong bo nho)');
+
+// =====================================================================
+//  2. Server sắp tắt (Render deploy bản mới / khởi động lại): lưu lần cuối, báo các máy nối lại, rồi mới thoát
+// =====================================================================
+let _stopping = false;
+async function gracefulStop(sig) {
+    if (_stopping) return; _stopping = true;
+    console.log(`[TAT-SERVER] nhan ${sig} — luu phong lan cuoi...`);
+    try { if (global.__flushRooms) { const n = await Promise.race([global.__flushRooms(), new Promise(r => setTimeout(() => r(-1), 4000))]); console.log(`[TAT-SERVER] da luu ${n} muc len Upstash`); } } catch (e) { console.log('[TAT-SERVER] loi khi luu: ' + (e && e.message)); }
+    for (const ws of wss.clients) { try { ws.close(1012, 'server restart'); } catch (e) {} }   // 1012 = server khởi động lại -> máy tự nối lại
+    setTimeout(() => process.exit(0), 300);
+}
+process.on('SIGTERM', () => gracefulStop('SIGTERM'));
+process.on('SIGINT', () => gracefulStop('SIGINT'));
